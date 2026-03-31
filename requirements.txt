@@ -1,2 +1,5 @@
 # pip install -r requirements.txt
-cryptography==42.0.2 
+cryptography>=46.0.0
+argon2-cffi>=25.0.0
+customtkinter>=5.2.0
+pyinstaller>=6.0.0

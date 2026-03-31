@@ -1,651 +1,1061 @@
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox, simpledialog
+import customtkinter as ctk
+from tkinter import filedialog, messagebox
 from pathlib import Path
-import shutil
-from cryptography.fernet import Fernet
-from cryptography.hazmat.primitives import hashes
-from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
-import base64
 import os
-from datetime import datetime
 import threading
-import tkinter.filedialog as tkfiledialog
-import re
 import hashlib
 import sys
+import base64
+import re
 
-class CustomPasswordDialog(simpledialog.Dialog):
-    COMMON_PASSWORDS = {"12345678", "password", "qwerty", "123456789", "11111111", "123456", "1234567890", "123123", "abc123", "password1"}
+# Cryptographic libraries
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+from cryptography.exceptions import InvalidTag
+import argon2
 
-    def __init__(self, parent, title, prompt, confirm=False, check_strength=True):
+# Global Constants
+MAGIC_BYTES = b"CORE_DMP"
+CHUNK_SIZE = 1024 * 1024  # 1MB chunk size
+HEADER_SIZE = len(MAGIC_BYTES) + 16 + 12 + 32  # 68 bytes
+
+# Set initial theme and color
+ctk.set_appearance_mode("dark")
+ctk.set_default_color_theme("blue")
+
+class MultiFileReader:
+    """Virtual File Reader that seamlessly reads across multiple file parts."""
+    def __init__(self, paths):
+        self.paths = paths
+        self.idx = 0
+        self.f = open(self.paths[self.idx], 'rb')
+        
+    def read(self, size):
+        res = bytearray()
+        while len(res) < size:
+            chunk = self.f.read(size - len(res))
+            res.extend(chunk)
+            if not chunk:
+                self.f.close()
+                self.idx += 1
+                if self.idx < len(self.paths):
+                    self.f = open(self.paths[self.idx], 'rb')
+                else:
+                    break
+        return bytes(res)
+        
+    def seek_to_payload(self):
+        """Seeks past the 68-byte header on the first file to read payload."""
+        self.f.close()
+        self.idx = 0
+        self.f = open(self.paths[self.idx], 'rb')
+        self.f.seek(HEADER_SIZE)
+        
+    def close(self):
+        try: self.f.close()
+        except: pass
+
+class CustomPasswordDialog(ctk.CTkToplevel):
+    COMMON_PASSWORDS = {"12345678", "password", "qwerty", "123456789", "11111111", "123456", "1234567890", "123123", "abc123", "password1","123"}
+
+    def __init__(self, master, title, prompt, confirm=False, check_strength=True):
+        super().__init__(master)
+        self.title(title)
+        
+        # Responsive geometry & Centering
+        width = 400
+        height = 360 if confirm else 260
+        
+        screen_width = self.winfo_screenwidth()
+        screen_height = self.winfo_screenheight()
+        x = int((screen_width / 2) - (width / 2))
+        y = int((screen_height / 2) - (height / 2))
+        
+        self.geometry(f"{width}x{height}+{x}+{y}")
+        self.resizable(False, False)
+        
         self.prompt = prompt
         self.confirm = confirm
         self.check_strength = check_strength
-        super().__init__(parent, title)
+        self.result = None
+        self.confirm_result = None
+        
+        self.transient(master)
+        self.grab_set()
 
-    def body(self, master):
-        if not self.confirm and not self.check_strength:
-            self.geometry("300x150")
-        else:
-            self.geometry("300x240")
-        label = ttk.Label(master, text=self.prompt, wraplength=200, anchor="center", justify="center", font=("Tahoma", 12))
-        label.grid(row=0, column=0, columnspan=2, pady=(15, 5), padx=10)
-        self.show_password = tk.BooleanVar(value=False)
-        self.password = ttk.Entry(master, show="*", width=18, justify="center", font=("Tahoma", 12))
-        self.password.grid(row=1, column=0, pady=(0, 5), padx=10)
-        show_btn = ttk.Checkbutton(master, text="Show", variable=self.show_password, command=self.toggle_password, style="TCheckbutton.TCheckbutton")
-        show_btn.grid(row=1, column=1, padx=2)
+        self._build_ui()
+        self.wait_window()
+
+    def _build_ui(self):
+        lbl = ctk.CTkLabel(self, text=self.prompt, font=("Arial", 15, "bold"))
+        lbl.pack(pady=(25, 15))
+
+        self.pwd_var = ctk.StringVar()
+        self.pwd_entry = ctk.CTkEntry(self, textvariable=self.pwd_var, show="*", width=250, height=35, justify="center", font=("Arial", 14))
+        self.pwd_entry.pack(pady=(0, 10))
+
         if self.check_strength:
-            self.strength_label = ttk.Label(master, text="", font=("Tahoma", 12))
-            self.strength_label.grid(row=2, column=0, columnspan=2, pady=(0, 5))
-            self.password.bind('<KeyRelease>', self.update_strength)
+            self.strength_label = ctk.CTkLabel(self, text="", font=("Arial", 12))
+            self.strength_label.pack(pady=(0, 5))
+            self.pwd_var.trace_add("write", self.update_strength)
+
         if self.confirm:
-            self.confirm_label = ttk.Label(master, text="Confirm password:", font=("Tahoma", 12))
-            self.confirm_label.grid(row=3, column=0, columnspan=2, pady=(0, 2))
-            self.confirm_entry = ttk.Entry(master, show="*", width=18, justify="center", font=("Tahoma", 12))
-            self.confirm_entry.grid(row=4, column=0, pady=(0, 10), padx=10)
-            show_btn2 = ttk.Checkbutton(master, text="Show", variable=self.show_password, command=self.toggle_confirm, style="TCheckbutton.TCheckbutton")
-            show_btn2.grid(row=4, column=1, padx=2)
-        self.password.bind('<Return>', lambda event: self.ok())
-        return self.password
+            lbl_confirm = ctk.CTkLabel(self, text="Confirm password:", font=("Arial", 13))
+            lbl_confirm.pack(pady=(5, 5))
+            self.confirm_var = ctk.StringVar()
+            self.confirm_entry = ctk.CTkEntry(self, textvariable=self.confirm_var, show="*", width=250, height=35, justify="center", font=("Arial", 14))
+            self.confirm_entry.pack(pady=(0, 10))
+
+        self.show_switch = ctk.CTkSwitch(self, text="Show Passwords", command=self.toggle_password, font=("Arial", 12))
+        self.show_switch.pack(pady=(5, 15))
+
+        btn_frame = ctk.CTkFrame(self, fg_color="transparent")
+        btn_frame.pack(pady=(10, 20))
+        
+        btn_ok = ctk.CTkButton(btn_frame, text="OK", width=120, height=35, font=("Arial", 14, "bold"), command=self.apply)
+        btn_ok.grid(row=0, column=0, padx=15)
+        
+        btn_cancel = ctk.CTkButton(btn_frame, text="Cancel", width=120, height=35, font=("Arial", 14), fg_color="gray", hover_color="#555555", command=self.destroy)
+        btn_cancel.grid(row=0, column=1, padx=15)
+        
+        self.bind('<Return>', lambda event: self.apply())
 
     def toggle_password(self):
-        if self.show_password.get():
-            self.password.config(show="")
-            if self.confirm:
-                self.confirm_entry.config(show="")
-        else:
-            self.password.config(show="*")
-            if self.confirm:
-                self.confirm_entry.config(show="*")
+        show_char = "" if self.show_switch.get() == 1 else "*"
+        self.pwd_entry.configure(show=show_char)
+        if self.confirm:
+            self.confirm_entry.configure(show=show_char)
 
-    def toggle_confirm(self):
-        self.toggle_password()
-
-    def update_strength(self, event=None):
-        pwd = self.password.get()
-        if len(pwd) < 8:
-            self.strength_label.config(text="Too short", foreground="red")
+    def update_strength(self, *args):
+        pwd = self.pwd_var.get()
+        if len(pwd) == 0:
+            self.strength_label.configure(text="")
+            return
+            
+        if pwd.lower() in self.COMMON_PASSWORDS:
+            self.strength_label.configure(text="Common password!", text_color="#ffaa00")
+        elif len(pwd) < 8:
+            self.strength_label.configure(text="Too short", text_color="#ff4444")
         elif not any(c.isalpha() for c in pwd) or not any(c.isdigit() for c in pwd):
-            self.strength_label.config(text="Add letters and numbers", foreground="red")
-        elif pwd.lower() in self.COMMON_PASSWORDS:
-            self.strength_label.config(text="Common password!", foreground="orange")
+            self.strength_label.configure(text="Add letters & numbers", text_color="#ffaa00")
         else:
-            self.strength_label.config(text="Good password", foreground="green")
+            self.strength_label.configure(text="Strong password", text_color="#00cc66")
 
     def apply(self):
-        self.result = self.password.get()
+        self.result = self.pwd_var.get()
         if self.confirm:
-            self.confirm_result = self.confirm_entry.get()
-        else:
-            self.confirm_result = None
+            self.confirm_result = self.confirm_var.get()
+        self.destroy()
 
-class FileEncryptorGUI:
-    def __init__(self, root):
-        self.root = root
-        self.root.title("File Encryption Tool")
-        self.root.geometry("600x400")
-        # Always use the directory of the executable or script
-        if getattr(sys, 'frozen', False):
-            self.BASE_DIR = Path(sys.executable).parent.absolute()
-        else:
-            self.BASE_DIR = Path(__file__).parent.absolute()
-        self.ENCRYPTED_DIR = self.BASE_DIR / "encrypted_files"
-        self.DECRYPTED_DIR = self.BASE_DIR / "decrypted_files"
-        self.ensure_directories()
+class FileEncryptorGUI(ctk.CTk):
+    def __init__(self):
+        super().__init__()
+        self.title("VibeCrypt - Advanced File Security")
         
-        # --- Tabs ---
-        style = ttk.Style()
-        style.configure("TCheckbutton.TCheckbutton", font=("Tahoma", 12))
+        # Center Main Window
+        width = 750
+        height = 680
+        screen_width = self.winfo_screenwidth()
+        screen_height = self.winfo_screenheight()
+        x = int((screen_width / 2) - (width / 2))
+        y = int((screen_height / 2) - (height / 2))
         
-        self.notebook = ttk.Notebook(root)
-        self.notebook.pack(fill="both", expand=True)
+        self.geometry(f"{width}x{height}+{x}+{y}")
+        self.minsize(700, 650)
         
-        # --- Encrypt Tab ---
-        self.encrypt_tab = ttk.Frame(self.notebook)
-        self.notebook.add(self.encrypt_tab, text="🔒 Encrypt")
+        # State variables
+        self.enc_file_paths = []
+        self.dec_file_paths = []
+        
+        # Header
+        self.header_frame = ctk.CTkFrame(self, fg_color="transparent")
+        self.header_frame.pack(fill="x", padx=20, pady=10)
+        
+        self.title_label = ctk.CTkLabel(self.header_frame, text="VibeCrypt Security", font=("Arial", 20, "bold"))
+        self.title_label.pack(side="left")
+        
+        self.theme_switch = ctk.CTkSwitch(self.header_frame, text="Dark Mode", font=("Arial", 12), command=self.toggle_theme)
+        self.theme_switch.pack(side="right")
+        self.theme_switch.select()
+
+        # Tabview
+        self.tabview = ctk.CTkTabview(self)
+        self.tabview.pack(fill="both", expand=True, padx=20, pady=(0, 20))
+        self.tabview._segmented_button.configure(font=("Arial", 16, "bold"))
+        
+        self.tabview.add("Encrypt")
+        self.tabview.add("Decrypt")
+        self.tabview.add("Text Vault")
+        self.tabview.add("Compare")
+        self.tabview.add("Hash")
+        self.tabview.add("Help")
+
         self._build_encrypt_tab()
-
-        # --- Decrypt Tab ---
-        self.decrypt_tab = ttk.Frame(self.notebook)
-        self.notebook.add(self.decrypt_tab, text="🔓 Decrypt")
         self._build_decrypt_tab()
-
-        # --- Compare Tab ---
-        self.compare_tab = ttk.Frame(self.notebook)
-        self.notebook.add(self.compare_tab, text="📝 Compare")
+        self._build_text_vault_tab()
         self._build_compare_tab()
-
-        # --- File Hash Tab ---
-        self.hash_tab = ttk.Frame(self.notebook)
-        self.notebook.add(self.hash_tab, text="🔍 File Hash")
         self._build_hash_tab()
-
-        # --- Help Tab ---
-        self.help_tab = ttk.Frame(self.notebook)
-        self.notebook.add(self.help_tab, text="📚 Help")
         self._build_help_tab()
 
-        self.notebook.bind("<<NotebookTabChanged>>", self._on_tab_changed)
+    def toggle_theme(self):
+        if self.theme_switch.get() == 1:
+            ctk.set_appearance_mode("dark")
+        else:
+            ctk.set_appearance_mode("light")
+
+    def _setup_text_bindings(self, widget, readonly=False):
+        """Injects robust context menu and Universal keyboard shortcuts (Ctrl+V, etc.)"""
+        target = widget._textbox if hasattr(widget, "_textbox") else widget
+
+        def _copy(e=None):
+            target.event_generate("<<Copy>>")
+            return "break"
+
+        def _cut(e=None):
+            if not readonly:
+                target.event_generate("<<Cut>>")
+            return "break"
+
+        def _paste(e=None):
+            if not readonly:
+                try:
+                    text = self.clipboard_get()
+                    # Delete currently selected text before pasting
+                    try:
+                        target.delete("sel.first", "sel.last")
+                    except:
+                        pass
+                    target.insert("insert", text)
+                except Exception:
+                    pass
+            return "break"
+
+        def _select_all(e=None):
+            target.tag_add("sel", "1.0", "end")
+            return "break"
+
+        # Context Menu
+        menu = tk.Menu(self, tearoff=0, font=("Arial", 11))
+        if not readonly:
+            menu.add_command(label="Cut", command=_cut)
+        menu.add_command(label="Copy", command=_copy)
+        if not readonly:
+            menu.add_command(label="Paste", command=_paste)
+
+        def _show_menu(event):
+            menu.tk_popup(event.x_root, event.y_root)
+
+        target.bind("<Button-3>", _show_menu)
+
+        # Universal Keyboard Shortcuts Handler (Language Agnostic)
+        def _universal_ctrl(event):
+            if getattr(event, 'keycode', None) == 86 or getattr(event, 'keysym', '').lower() == 'v':
+                return _paste()
+            elif getattr(event, 'keycode', None) == 67 or getattr(event, 'keysym', '').lower() == 'c':
+                return _copy()
+            elif getattr(event, 'keycode', None) == 88 or getattr(event, 'keysym', '').lower() == 'x':
+                return _cut()
+            elif getattr(event, 'keycode', None) == 65 or getattr(event, 'keysym', '').lower() == 'a':
+                return _select_all()
+
+        target.bind("<Control-KeyPress>", _universal_ctrl)
+
+    # --- Core Cryptography Methods ---
+    def derive_keys(self, password: str, salt: bytes):
+        """Generates Master Key with Argon2id and splits it using HKDF."""
+        master_key = argon2.low_level.hash_secret_raw(
+            secret=password.encode('utf-8'),
+            salt=salt,
+            time_cost=3,
+            memory_cost=65536,
+            parallelism=4,
+            hash_len=32, # Master key is exactly 32 bytes
+            type=argon2.low_level.Type.ID
+        )
+        
+        # Use HKDF to safely generate independent keys
+        hkdf = HKDF(
+            algorithm=hashes.SHA256(),
+            length=64, # Generate 64 bytes total
+            salt=salt, # Reusing Argon2 salt is safe here
+            info=b"VibeCrypt-KeyExpansion"
+        )
+        expanded_key = hkdf.derive(master_key)
+        
+        return expanded_key[:32], expanded_key[32:]
+
+    def _get_parts(self, base_path):
+        clean_path = re.sub(r'\.part\d{3}$', '', str(base_path))
+        
+        if os.path.exists(clean_path):
+            return [clean_path]
+            
+        parts = []
+        i = 1
+        while True:
+            part_name = f"{clean_path}.part{i:03d}"
+            if os.path.exists(part_name):
+                parts.append(part_name)
+                i += 1
+            else:
+                break
+                
+        if not parts:
+            raise FileNotFoundError(f"File or parts not found: {clean_path}")
+        return parts
+
+    def _secure_shred_file(self, file_base_path, lbl_cur, bar_cur, file_name):
+        try:
+            parts = self._get_parts(file_base_path)
+            total_shred_size = sum(os.path.getsize(p) for p in parts)
+            shredded_bytes = 0
+            
+            for part in parts:
+                part_size = os.path.getsize(part)
+                with open(part, "ba+", buffering=0) as f:
+                    f.seek(0)
+                    written = 0
+                    while written < part_size:
+                        write_size = min(CHUNK_SIZE, part_size - written)
+                        f.write(os.urandom(write_size))
+                        written += write_size
+                        shredded_bytes += write_size
+                        
+                        pct = (shredded_bytes / total_shred_size) if total_shred_size > 0 else 1.0
+                        self.after(0, lambda p=pct, fn=file_name: [
+                            bar_cur.set(p),
+                            lbl_cur.configure(text=f"Shredding: {fn} ({int(p*100)}%)")
+                        ])
+                        
+                directory = os.path.dirname(part)
+                random_name = os.path.join(directory, os.urandom(8).hex() + ".tmp")
+                os.rename(part, random_name)
+                os.remove(random_name)
+        except Exception as e:
+            raise Exception(f"Shredding failed: {str(e)}")
+
+    def _warn_shredding(self, var):
+        if var.get():
+            messagebox.showwarning(
+                "Warning: Permanent Deletion", 
+                "This action is IRREVERSIBLE!\n\n"
+                "The original files will be completely destroyed so they can NEVER be recovered.\n\n"
+                "This deep cleaning takes extra time. Please be patient and do not close the app."
+            )
+
+    def _toggle_split_entry(self):
+        if self.enc_split_var.get():
+            self.enc_split_entry.configure(state="normal")
+        else:
+            self.enc_split_entry.configure(state="disabled")
+            self.enc_split_entry.delete(0, "end")
+
+    # --- UI Progress Builders ---
+    def _build_progress_ui(self, parent_frame, is_encrypt=True):
+        prog_frame = ctk.CTkFrame(parent_frame, fg_color="transparent")
+        
+        lbl_overall = ctk.CTkLabel(prog_frame, text="Overall Progress:", font=("Arial", 13, "bold"))
+        bar_overall = ctk.CTkProgressBar(prog_frame, width=450)
+        bar_overall.set(0)
+        
+        lbl_current = ctk.CTkLabel(prog_frame, text="Current File: 0%", font=("Arial", 12))
+        bar_current = ctk.CTkProgressBar(prog_frame, width=450)
+        bar_current.set(0)
+        
+        if is_encrypt:
+            self.enc_prog_frame = prog_frame
+            self.enc_lbl_overall = lbl_overall
+            self.enc_bar_overall = bar_overall
+            self.enc_lbl_current = lbl_current
+            self.enc_bar_current = bar_current
+        else:
+            self.dec_prog_frame = prog_frame
+            self.dec_lbl_overall = lbl_overall
+            self.dec_bar_overall = bar_overall
+            self.dec_lbl_current = lbl_current
+            self.dec_bar_current = bar_current
+
+    def _show_progress_ui(self, is_encrypt, is_batch):
+        frame = self.enc_prog_frame if is_encrypt else self.dec_prog_frame
+        lbl_ovr = self.enc_lbl_overall if is_encrypt else self.dec_lbl_overall
+        bar_ovr = self.enc_bar_overall if is_encrypt else self.dec_bar_overall
+        lbl_cur = self.enc_lbl_current if is_encrypt else self.dec_lbl_current
+        bar_cur = self.enc_bar_current if is_encrypt else self.dec_bar_current
+        
+        frame.pack(pady=(10, 5))
+        
+        bar_ovr.set(0)
+        bar_cur.set(0)
+        lbl_ovr.configure(text="Overall Progress:")
+        lbl_cur.configure(text="Preparing...")
+        
+        if is_batch:
+            lbl_ovr.pack(anchor="w", padx=20)
+            bar_ovr.pack(pady=(0, 15))
+            
+        lbl_cur.pack(anchor="w", padx=20)
+        bar_cur.pack(pady=(0, 5))
+
+    def _hide_progress_ui(self, is_encrypt):
+        frame = self.enc_prog_frame if is_encrypt else self.dec_prog_frame
+        frame.pack_forget()
+        for widget in frame.winfo_children():
+            widget.pack_forget()
 
     # --- Encrypt Tab ---
     def _build_encrypt_tab(self):
-        frame = self.encrypt_tab
-        self.enc_file_path_var = tk.StringVar()
-        ttk.Label(frame, text="Select file to encrypt:", font=("Tahoma", 12)).pack(pady=(20, 5))
-        entry = ttk.Entry(frame, textvariable=self.enc_file_path_var, width=40, state="readonly", font=("Tahoma", 12))
-        entry.pack(pady=2)
-        ttk.Button(frame, text="📁 Browse", command=self.browse_encrypt_file, style="TButton.TButton").pack(pady=2)
-        self.encrypt_button = tk.Button(frame, text="🔒 Encrypt", bg="#4CAF50", fg="white", font=("Tahoma", 12), command=self.encrypt_file)
-        self.encrypt_button.pack(pady=(15, 5), ipadx=10, ipady=3)
-        self.progress = ttk.Progressbar(frame, mode="determinate", length=250, maximum=100)
-        self.progress.pack(pady=(10, 0))
-        self.progress.pack_forget()
-        self.progress_label = ttk.Label(frame, text="", font=("Tahoma", 12))
-        self.progress_label.pack()
-        self.progress_label.pack_forget()
-        self.progress_stage_label = ttk.Label(frame, text="", font=("Tahoma", 12))
-        self.progress_stage_label.pack()
-        self.progress_stage_label.pack_forget()
+        frame = self.tabview.tab("Encrypt")
+        self.enc_display_var = ctk.StringVar()
+        
+        ctk.CTkLabel(frame, text="Select file(s) to encrypt:", font=("Arial", 15)).pack(pady=(35, 10))
+        
+        entry_frame = ctk.CTkFrame(frame, fg_color="transparent")
+        entry_frame.pack(fill="x", padx=40, pady=5)
+        
+        ctk.CTkEntry(entry_frame, textvariable=self.enc_display_var, state="readonly", height=35).pack(side="left", fill="x", expand=True, padx=(0, 10))
+        ctk.CTkButton(entry_frame, text="Browse", width=100, height=35, font=("Arial", 13), command=self.browse_encrypt_files).pack(side="right")
+        
+        options_frame = ctk.CTkFrame(frame, fg_color="transparent")
+        options_frame.pack(fill="x", padx=40, pady=(20, 0))
+        
+        self.enc_shred_var = ctk.BooleanVar(value=False)
+        self.enc_shred_cb = ctk.CTkCheckBox(options_frame, text="Permanently delete original file(s) to prevent recovery", variable=self.enc_shred_var, font=("Arial", 13), command=lambda: self._warn_shredding(self.enc_shred_var))
+        self.enc_shred_cb.pack(anchor="w", pady=(0, 10))
+        
+        split_frame = ctk.CTkFrame(options_frame, fg_color="transparent")
+        split_frame.pack(anchor="w")
+        
+        self.enc_split_var = ctk.BooleanVar(value=False)
+        self.enc_split_cb = ctk.CTkCheckBox(split_frame, text="Split into parts", variable=self.enc_split_var, font=("Arial", 13), command=self._toggle_split_entry)
+        self.enc_split_cb.pack(side="left", pady=5)
+        
+        self.enc_split_entry = ctk.CTkEntry(split_frame, placeholder_text="Size (MB)", width=100, height=30, font=("Arial", 12))
+        self.enc_split_entry.pack(side="left", padx=15)
+        self.enc_split_entry.configure(state="disabled")
 
-    def browse_encrypt_file(self):
-        path = tkfiledialog.askopenfilename()
-        if path:
-            self.enc_file_path_var.set(path)
+        self.encrypt_button = ctk.CTkButton(frame, text="ENCRYPT", font=("Arial", 15, "bold"), fg_color="#28a745", hover_color="#218838", command=self.encrypt_action)
+        self.encrypt_button.pack(pady=(15, 25), ipadx=25, ipady=8)
+        
+        self._build_progress_ui(frame, is_encrypt=True)
 
-    def encrypt_file(self):
-        file_path = self.enc_file_path_var.get()
-        if not file_path:
-            messagebox.showerror("Error", "Please select a file first!")
+    def browse_encrypt_files(self):
+        paths = filedialog.askopenfilenames(title="Select Files to Encrypt")
+        if paths:
+            self.enc_file_paths = list(paths)
+            if len(self.enc_file_paths) == 1:
+                self.enc_display_var.set(Path(self.enc_file_paths[0]).name)
+            else:
+                self.enc_display_var.set(f"{len(self.enc_file_paths)} files selected")
+
+    def encrypt_action(self):
+        if not self.enc_file_paths:
+            messagebox.showerror("Error", "Please select at least one file!")
             return
-        dialog = CustomPasswordDialog(self.root, "Password", "Enter encryption password:", confirm=True, check_strength=True)
-        password = dialog.result
-        confirm_password = dialog.confirm_result
-        if not password:
-            return
-        if password != confirm_password:
-            messagebox.showwarning("Password Mismatch", "Passwords do not match.")
-            return
-        input_path = Path(file_path)
-        encrypted_file = self.ENCRYPTED_DIR / f"encrypted_{input_path.name}.enc"
-        if encrypted_file.exists():
-            if not messagebox.askyesno("Overwrite?", f"File {encrypted_file.name} already exists. Overwrite?"):
+            
+        split_size_mb = 0
+        if self.enc_split_var.get():
+            try:
+                split_size_mb = int(self.enc_split_entry.get())
+                if split_size_mb <= 0: raise ValueError
+            except ValueError:
+                messagebox.showerror("Error", "Please enter a valid positive integer for Split Size (MB).")
                 return
-        self.progress.pack()
-        self.progress_label.pack()
-        self.progress_stage_label.pack()
-        self.progress_stage_label.config(text="Generating key...")
-        self.encrypt_button.config(state="disabled")
-        threading.Thread(target=self._encrypt_file_thread, args=(file_path, password), daemon=True).start()
 
-    def _set_progress(self, percent):
-        self.progress['value'] = percent
-        self.progress_label.config(text=f"{percent}%")
-        self.root.update_idletasks()
+        dialog = CustomPasswordDialog(self, "Password", "Enter encryption password:", confirm=True, check_strength=True)
+        password = dialog.result
+        if not password or password != dialog.confirm_result:
+            if password: messagebox.showwarning("Mismatch", "Passwords do not match.")
+            return
 
-    def _encrypt_file_thread(self, file_path, password):
-        try:
-            self.progress.pack()
-            self.progress_label.pack()
-            self.progress_stage_label.config(text="Encrypting...")
-            self.progress_stage_label.pack()
-            self._set_progress(0)
-            file_size = os.path.getsize(file_path)
-            chunk_size = 1024 * 1024
-            data = bytearray()
-            with open(file_path, 'rb') as file:
-                read = 0
-                while True:
-                    chunk = file.read(chunk_size)
-                    if not chunk:
-                        break
-                    data.extend(chunk)
-                    read += len(chunk)
-                    percent = int((read / file_size) * 100)
-                    self.root.after(0, self._set_progress, percent)
-            salt = os.urandom(16)
-            key = self.generate_key(password, salt)
-            f = Fernet(key)
-            encrypted_data = f.encrypt(bytes(data))
-            self.root.after(0, lambda: [
-                self._set_progress(0),
-                self.progress_stage_label.config(text="Saving encrypted file...")
-            ])
-            input_path = Path(file_path)
-            encrypted_file = self.ENCRYPTED_DIR / f"encrypted_{input_path.name}.enc"
-            with open(encrypted_file, "wb") as f_enc:
-                f_enc.write(salt)
-                written = 0
-                total = len(encrypted_data)
-                while written < total:
-                    chunk = encrypted_data[written:written+chunk_size]
-                    f_enc.write(chunk)
-                    written += len(chunk)
-                    percent = int((written / total) * 100)
-                    self.root.after(0, self._set_progress, percent)
-            orig_hash = self._file_hash(file_path)
-            enc_hash = self._file_hash(str(encrypted_file))
-            self.root.after(0, lambda: [
-                self._set_progress(100),
-                self.progress.pack_forget(),
-                self.progress_label.pack_forget(),
-                self.progress_stage_label.pack_forget(),
-                self.encrypt_button.config(state="normal"),
-                messagebox.showinfo("Success", f"File encrypted successfully!\nSaved as: {self.ENCRYPTED_DIR / f'encrypted_{Path(file_path).name}.enc'}"),
-                self.enc_file_path_var.set("")
-            ])
-        except Exception as e:
-            self.root.after(0, lambda: [
-                self._set_progress(0),
-                self.progress.pack_forget(),
-                self.progress_label.pack_forget(),
-                self.progress_stage_label.pack_forget(),
-                self.encrypt_button.config(state="normal"),
-                messagebox.showerror("Error", f"Encryption failed: {str(e)}")
-            ])
+        is_batch = len(self.enc_file_paths) > 1
+        output_paths = []
+        
+        if not is_batch:
+            out_path = filedialog.asksaveasfilename(initialfile=Path(self.enc_file_paths[0]).name, title="Save Encrypted File As")
+            if not out_path: return
+            output_paths.append(out_path)
+        else:
+            out_dir = filedialog.askdirectory(title="Select Destination Folder")
+            if not out_dir: return
+            
+            for p in self.enc_file_paths:
+                base_path = Path(p)
+                dest_path = Path(out_dir) / base_path.name
+                if dest_path.resolve() == base_path.resolve():
+                    dest_path = dest_path.with_name(dest_path.stem + "_out" + dest_path.suffix)
+                output_paths.append(str(dest_path))
+
+        self.encrypt_button.configure(state="disabled")
+        self._show_progress_ui(is_encrypt=True, is_batch=is_batch)
+        
+        threading.Thread(target=self._batch_process_thread, args=(self.enc_file_paths, output_paths, password, True, split_size_mb), daemon=True).start()
 
     # --- Decrypt Tab ---
     def _build_decrypt_tab(self):
-        frame = self.decrypt_tab
-        ttk.Label(frame, text="Encrypted files:", font=("Tahoma", 12)).pack(pady=(20, 5))
-        self.file_listbox = tk.Listbox(frame, height=10, font=("Tahoma", 12))
-        self.file_listbox.pack(fill="x", padx=20, pady=2)
-        self.refresh_button = ttk.Button(frame, text="🔄 Refresh List", command=self.refresh_file_list, style="TButton.TButton")
-        self.refresh_button.pack(pady=2)
-        self.decrypt_button = tk.Button(frame, text="🔓 Decrypt Selected", bg="#2196F3", fg="white", font=("Tahoma", 12), command=self.decrypt_file)
-        self.decrypt_button.pack(pady=(15, 5), ipadx=10, ipady=3)
-        self.dec_progress = ttk.Progressbar(frame, mode="determinate", length=250, maximum=100)
-        self.dec_progress.pack(pady=(10, 0))
-        self.dec_progress.pack_forget()
-        self.dec_progress_label = ttk.Label(frame, text="", font=("Tahoma", 12))
-        self.dec_progress_label.pack()
-        self.dec_progress_label.pack_forget()
-        self.dec_progress_stage_label = ttk.Label(frame, text="", font=("Tahoma", 12))
-        self.dec_progress_stage_label.pack()
-        self.dec_progress_stage_label.pack_forget()
-        self.refresh_file_list()
+        frame = self.tabview.tab("Decrypt")
+        self.dec_display_var = ctk.StringVar()
+        
+        ctk.CTkLabel(frame, text="Select encrypted file(s) or Base Part (.part001):", font=("Arial", 15)).pack(pady=(35, 10))
+        
+        entry_frame = ctk.CTkFrame(frame, fg_color="transparent")
+        entry_frame.pack(fill="x", padx=40, pady=5)
+        
+        ctk.CTkEntry(entry_frame, textvariable=self.dec_display_var, state="readonly", height=35).pack(side="left", fill="x", expand=True, padx=(0, 10))
+        ctk.CTkButton(entry_frame, text="Browse", width=100, height=35, font=("Arial", 13), command=self.browse_decrypt_files).pack(side="right")
+        
+        self.dec_shred_var = ctk.BooleanVar(value=False)
+        self.dec_shred_cb = ctk.CTkCheckBox(
+            frame, text="Permanently delete encrypted file(s)/parts to prevent recovery", 
+            variable=self.dec_shred_var, font=("Arial", 13),
+            command=lambda: self._warn_shredding(self.dec_shred_var)
+        )
+        self.dec_shred_cb.pack(pady=(20, 0), padx=40, anchor="w")
 
-    def refresh_file_list(self):
-        self.file_listbox.delete(0, tk.END)
-        encrypted_files = list(Path(self.ENCRYPTED_DIR).glob("encrypted_*.enc"))
-        for file in encrypted_files:
-            self.file_listbox.insert(tk.END, file.name)
+        self.decrypt_button = ctk.CTkButton(frame, text="DECRYPT", font=("Arial", 15, "bold"), fg_color="#007bff", hover_color="#0069d9", command=self.decrypt_action)
+        self.decrypt_button.pack(pady=(15, 25), ipadx=25, ipady=8)
+        
+        self._build_progress_ui(frame, is_encrypt=False)
 
-    def decrypt_file(self):
-        selection = self.file_listbox.curselection()
-        if not selection:
-            messagebox.showerror("Error", "Please select a file to decrypt!")
+    def browse_decrypt_files(self):
+        paths = filedialog.askopenfilenames(title="Select Encrypted Files")
+        if paths:
+            clean_paths = []
+            for p in paths:
+                base = re.sub(r'\.part\d{3}$', '', p)
+                if base not in clean_paths:
+                    clean_paths.append(base)
+            
+            self.dec_file_paths = clean_paths
+            if len(self.dec_file_paths) == 1:
+                self.dec_display_var.set(Path(self.dec_file_paths[0]).name)
+            else:
+                self.dec_display_var.set(f"{len(self.dec_file_paths)} files/archives selected")
+
+    def decrypt_action(self):
+        if not self.dec_file_paths:
+            messagebox.showerror("Error", "Please select at least one file!")
             return
-        encrypted_file = self.file_listbox.get(selection[0])
-        encrypted_path = Path(self.ENCRYPTED_DIR) / encrypted_file
-        dialog = CustomPasswordDialog(self.root, "Password", "Enter decryption password:", confirm=False, check_strength=False)
+            
+        dialog = CustomPasswordDialog(self, "Password", "Enter decryption password:", confirm=False, check_strength=False)
         password = dialog.result
         if not password:
             return
-        original_name = encrypted_file.replace("encrypted_", "").replace(".enc", "")
-        output_filename = Path(self.DECRYPTED_DIR) / original_name
-        if output_filename.exists():
-            if not messagebox.askyesno("Overwrite?", f"File {output_filename.name} already exists. Overwrite?"):
-                return
-        self.decrypt_button.config(state="disabled")
-        threading.Thread(target=self._decrypt_file_thread, args=(encrypted_path, encrypted_file, password), daemon=True).start()
 
-    def _set_dec_progress(self, percent):
-        self.dec_progress['value'] = percent
-        self.dec_progress_label.config(text=f"{percent}%")
-        self.root.update_idletasks()
+        self.decrypt_button.configure(state="disabled")
+        is_batch = len(self.dec_file_paths) > 1
+        self._show_progress_ui(is_encrypt=False, is_batch=is_batch)
+        
+        first_file_base = self.dec_file_paths[0]
+        threading.Thread(target=self._verify_password_thread, args=(first_file_base, password, is_batch), daemon=True).start()
 
-    def _decrypt_file_thread(self, encrypted_path, encrypted_file, password):
+    def _verify_password_thread(self, first_file_base, password, is_batch):
         try:
-            self.dec_progress.pack()
-            self.dec_progress_label.pack()
-            self.dec_progress_stage_label.config(text="Decrypting...")
-            self.dec_progress_stage_label.pack()
-            self._set_dec_progress(0)
-            file_size = os.path.getsize(encrypted_path)
-            chunk_size = 1024 * 1024
-            with open(encrypted_path, "rb") as f:
-                salt = f.read(16)
-                data = bytearray()
-                read = 16
-                while True:
-                    chunk = f.read(chunk_size)
-                    if not chunk:
-                        break
-                    data.extend(chunk)
-                    read += len(chunk)
-                    percent = int((read / file_size) * 100)
-                    self.root.after(0, self._set_dec_progress, percent)
-            key = self.generate_key(password, salt)
-            f = Fernet(key)
-            try:
-                decrypted_data = f.decrypt(bytes(data))
-            except Exception:
-                self.root.after(0, lambda: [
-                    self._set_dec_progress(0),
-                    self.dec_progress.pack_forget(),
-                    self.dec_progress_label.pack_forget(),
-                    self.dec_progress_stage_label.pack_forget(),
-                    self.decrypt_button.config(state="normal"),
-                    messagebox.showerror("Error", "Invalid password! Please try again.")
-                ])
-                return
-            self.root.after(0, lambda: [
-                self._set_dec_progress(0),
-                self.dec_progress_stage_label.config(text="Saving decrypted file...")
-            ])
-            original_name = encrypted_file.replace("encrypted_", "").replace(".enc", "")
-            output_filename = Path(self.DECRYPTED_DIR) / original_name
-            written = 0
-            total = len(decrypted_data)
-            with open(output_filename, "wb") as f_out:
-                while written < total:
-                    chunk = decrypted_data[written:written+chunk_size]
-                    f_out.write(chunk)
-                    written += len(chunk)
-                    percent = int((written / total) * 100)
-                    self.root.after(0, self._set_dec_progress, percent)
-            dec_file = Path(self.DECRYPTED_DIR) / original_name
-            orig_hash = self._file_hash(str(encrypted_path))
-            dec_hash = self._file_hash(str(dec_file))
-            self.root.after(0, lambda: [
-                self._set_dec_progress(100),
-                self.dec_progress.pack_forget(),
-                self.dec_progress_label.pack_forget(),
-                self.dec_progress_stage_label.pack_forget(),
-                self.decrypt_button.config(state="normal"),
-                messagebox.showinfo("Success", f"File decrypted successfully!\nSaved as: {self.DECRYPTED_DIR / encrypted_file.replace('encrypted_','').replace('.enc','')}"),
-            ])
+            parts = self._get_parts(first_file_base)
+            first_file = parts[0]
+            
+            with open(first_file, "rb") as f_in:
+                if f_in.read(len(MAGIC_BYTES)) != MAGIC_BYTES:
+                    raise ValueError(f"File '{Path(first_file).name}' is not encrypted by VibeCrypt.")
+                
+                salt = f_in.read(16)
+                f_in.read(12)
+                stored_hash = f_in.read(32)
+                
+                self.after(0, lambda: self.dec_lbl_current.configure(text="Verifying Password..."))
+                _, auth_key = self.derive_keys(password, salt)
+                
+                if hashlib.sha256(auth_key).digest() != stored_hash:
+                    raise ValueError("Invalid Password!")
+                    
+            self.after(0, self._prompt_save_and_decrypt_batch, password, is_batch)
+        except ValueError as ve:
+            self.after(0, lambda err=str(ve): self._on_operation_error("Decryption Error", err, is_encrypt=False))
         except Exception as e:
-            self.root.after(0, lambda: [
-                self._set_dec_progress(0),
-                self.dec_progress.pack_forget(),
-                self.dec_progress_label.pack_forget(),
-                self.dec_progress_stage_label.pack_forget(),
-                self.decrypt_button.config(state="normal"),
-                messagebox.showerror("Error", f"Decryption failed: {str(e)}")
-            ])
+            self.after(0, lambda err=str(e): self._on_operation_error("System Error", err, is_encrypt=False))
+
+    def _prompt_save_and_decrypt_batch(self, password, is_batch):
+        output_paths = []
+        
+        if not is_batch:
+            out_path = filedialog.asksaveasfilename(initialfile=Path(self.dec_file_paths[0]).name, title="Password Verified! Save File As")
+            if not out_path:
+                self._reset_ui_state(is_encrypt=False)
+                return
+            output_paths.append(out_path)
+        else:
+            out_dir = filedialog.askdirectory(title="Password Verified! Select Destination Folder")
+            if not out_dir:
+                self._reset_ui_state(is_encrypt=False)
+                return
+            
+            for p in self.dec_file_paths:
+                base_path = Path(p)
+                dest_path = Path(out_dir) / base_path.name
+                if dest_path.resolve() == base_path.resolve():
+                    dest_path = dest_path.with_name(dest_path.stem + "_out" + dest_path.suffix)
+                output_paths.append(str(dest_path))
+
+        threading.Thread(target=self._batch_process_thread, args=(self.dec_file_paths, output_paths, password, False, 0), daemon=True).start()
+
+    # --- Unified Batch Engine ---
+    def _batch_process_thread(self, in_paths, out_paths, password, is_encrypt, split_size_mb=0):
+        total_files = len(in_paths)
+        success_count = 0
+        errors = []
+        
+        lbl_overall = self.enc_lbl_overall if is_encrypt else self.dec_lbl_overall
+        bar_overall = self.enc_bar_overall if is_encrypt else self.dec_bar_overall
+        lbl_current = self.enc_lbl_current if is_encrypt else self.dec_lbl_current
+        bar_current = self.enc_bar_current if is_encrypt else self.dec_bar_current
+        
+        perform_shredding = self.enc_shred_var.get() if is_encrypt else self.dec_shred_var.get()
+
+        for idx in range(total_files):
+            in_p = in_paths[idx]
+            out_p = out_paths[idx]
+            file_name = Path(in_p).name
+            
+            if total_files > 1:
+                ovr_pct = idx / total_files
+                self.after(0, lambda p=ovr_pct, i=idx+1, t=total_files: [
+                    bar_overall.set(p),
+                    lbl_overall.configure(text=f"Overall Progress: {i}/{t} Files")
+                ])
+            
+            self.after(0, lambda fn=file_name: lbl_current.configure(text=f"Deriving Key for: {fn}"))
+            
+            try:
+                if is_encrypt:
+                    self._core_encrypt_stream(in_p, out_p, password, lbl_current, bar_current, file_name, split_size_mb)
+                else:
+                    self._core_decrypt_stream(in_p, out_p, password, lbl_current, bar_current, file_name)
+                
+                if perform_shredding:
+                    self.after(0, lambda fn=file_name: [
+                        bar_current.set(0),
+                        lbl_current.configure(text=f"Preparing to shred: {fn}...")
+                    ])
+                    self._secure_shred_file(in_p, lbl_current, bar_current, file_name)
+                
+                success_count += 1
+                
+            except Exception as e:
+                if is_encrypt and split_size_mb > 0:
+                    for p in self._get_parts(out_p):
+                        try: os.remove(p)
+                        except: pass
+                else:
+                    if os.path.exists(out_p):
+                        try: os.remove(out_p)
+                        except: pass
+                errors.append(f"{file_name}: {str(e)}")
+
+        if total_files > 1:
+            self.after(0, lambda: bar_overall.set(1.0))
+            
+        self.after(0, lambda s=success_count, t=total_files, e=errors: self._on_batch_complete(s, t, e, is_encrypt))
+
+    def _core_encrypt_stream(self, input_path, output_path, password, lbl_cur, bar_cur, file_name, split_size_mb):
+        salt = os.urandom(16)
+        nonce = os.urandom(12)
+        aes_key, auth_key = self.derive_keys(password, salt)
+        password_hash = hashlib.sha256(auth_key).digest()
+        
+        cipher = Cipher(algorithms.AES(aes_key), modes.GCM(nonce))
+        encryptor = cipher.encryptor()
+        
+        # Inject AAD for Header Integrity Check
+        header = MAGIC_BYTES + salt + nonce + password_hash
+        encryptor.authenticate_additional_data(header)
+        
+        file_size = os.path.getsize(input_path)
+        split_bytes = int(split_size_mb * 1024 * 1024) if split_size_mb > 0 else 0
+        part_num = 1
+        
+        def get_out_path(num):
+            if split_bytes > 0: return f"{output_path}.part{num:03d}"
+            return output_path
+            
+        current_out_path = get_out_path(part_num)
+        f_out = open(current_out_path, 'wb')
+        
+        f_out.write(header)
+        bytes_in_current_file = len(header)
+        
+        with open(input_path, 'rb') as f_in:
+            read_bytes = 0
+            while True:
+                chunk = f_in.read(CHUNK_SIZE)
+                if not chunk: break
+                enc_chunk = encryptor.update(chunk)
+                
+                written = 0
+                while written < len(enc_chunk):
+                    if split_bytes > 0:
+                        space_left = split_bytes - bytes_in_current_file
+                        to_write = min(len(enc_chunk) - written, space_left)
+                    else:
+                        to_write = len(enc_chunk) - written
+                        
+                    f_out.write(enc_chunk[written:written+to_write])
+                    written += to_write
+                    bytes_in_current_file += to_write
+                    
+                    if split_bytes > 0 and bytes_in_current_file >= split_bytes:
+                        f_out.close()
+                        part_num += 1
+                        current_out_path = get_out_path(part_num)
+                        f_out = open(current_out_path, 'wb')
+                        bytes_in_current_file = 0
+                
+                read_bytes += len(chunk)
+                pct = (read_bytes / file_size) if file_size > 0 else 1.0
+                self.after(0, lambda p=pct, fn=file_name: [
+                    bar_cur.set(p),
+                    lbl_cur.configure(text=f"Encrypting: {fn} ({int(p*100)}%)")
+                ])
+                
+        encryptor.finalize()
+        tag = encryptor.tag
+        
+        if split_bytes > 0 and bytes_in_current_file + len(tag) > split_bytes:
+            f_out.close()
+            part_num += 1
+            current_out_path = get_out_path(part_num)
+            f_out = open(current_out_path, 'wb')
+            
+        f_out.write(tag)
+        f_out.close()
+
+    def _core_decrypt_stream(self, input_path, output_path, password, lbl_cur, bar_cur, file_name):
+        parts = self._get_parts(input_path)
+        total_size = sum(os.path.getsize(p) for p in parts)
+        
+        with open(parts[-1], 'rb') as f_last:
+            f_last.seek(-16, os.SEEK_END)
+            tag = f_last.read(16)
+
+        data_size = total_size - HEADER_SIZE - 16
+        if data_size < 0: raise ValueError("File structure is corrupted.")
+        
+        with open(parts[0], 'rb') as f_first:
+            header_data = f_first.read(HEADER_SIZE)
+            salt = header_data[8:24]
+            nonce = header_data[24:36]
+            aes_key, _ = self.derive_keys(password, salt)
+            
+        cipher = Cipher(algorithms.AES(aes_key), modes.GCM(nonce, tag))
+        decryptor = cipher.decryptor()
+        
+        # Inject AAD for Header Integrity Check
+        decryptor.authenticate_additional_data(header_data)
+        
+        reader = MultiFileReader(parts)
+        reader.seek_to_payload()
+        
+        with open(output_path, "wb") as f_out:
+            read_bytes = 0
+            while read_bytes < data_size:
+                chunk = reader.read(min(CHUNK_SIZE, data_size - read_bytes))
+                f_out.write(decryptor.update(chunk))
+                read_bytes += len(chunk)
+                
+                pct = (read_bytes / data_size) if data_size > 0 else 1.0
+                self.after(0, lambda p=pct, fn=file_name: [
+                    bar_cur.set(p),
+                    lbl_cur.configure(text=f"Decrypting: {fn} ({int(p*100)}%)")
+                ])
+            try:
+                decryptor.finalize()
+            except InvalidTag:
+                raise ValueError("Data corruption detected (Invalid Auth Tag or Header).")
+            finally:
+                reader.close()
+
+    def _on_batch_complete(self, success_count, total_files, errors, is_encrypt):
+        self._hide_progress_ui(is_encrypt)
+        
+        if is_encrypt:
+            self.encrypt_button.configure(state="normal")
+            self.enc_file_paths = []
+            self.enc_display_var.set("")
+            self.enc_shred_var.set(False)
+            self.enc_split_var.set(False)
+            self._toggle_split_entry()
+        else:
+            self.decrypt_button.configure(state="normal")
+            self.dec_file_paths = []
+            self.dec_display_var.set("")
+            self.dec_shred_var.set(False)
+
+        action_str = "Processed"
+        
+        if success_count == total_files:
+            messagebox.showinfo("Success", f"Successfully {action_str} {success_count}/{total_files} file(s).")
+        elif success_count > 0:
+            err_msg = "\n".join(errors[:5])
+            if len(errors) > 5: err_msg += f"\n...and {len(errors)-5} more."
+            messagebox.showwarning("Partial Success", f"{success_count}/{total_files} file(s) {action_str}.\n\nErrors:\n{err_msg}")
+        else:
+            err_msg = "\n".join(errors[:5])
+            if len(errors) > 5: err_msg += f"\n...and {len(errors)-5} more."
+            messagebox.showerror("Failed", f"All files failed to process.\n\nErrors:\n{err_msg}")
+
+    # --- TEXT VAULT TAB ---
+    def _build_text_vault_tab(self):
+        frame = self.tabview.tab("Text Vault")
+        
+        frame.columnconfigure(0, weight=1)
+        frame.rowconfigure(1, weight=1)
+        frame.rowconfigure(4, weight=1)
+        
+        ctk.CTkLabel(frame, text="Input Text / Base64 Payload:", font=("Arial", 14, "bold")).grid(row=0, column=0, pady=(10, 5), sticky="w", padx=20)
+        self.text_input = ctk.CTkTextbox(frame, font=("Arial", 14))
+        self.text_input.grid(row=1, column=0, sticky="nsew", padx=20)
+        self._setup_text_bindings(self.text_input, readonly=False)
+        
+        btn_frame = ctk.CTkFrame(frame, fg_color="transparent")
+        btn_frame.grid(row=2, column=0, pady=15)
+        
+        ctk.CTkButton(btn_frame, text="🔒 ENCRYPT TEXT", font=("Arial", 13, "bold"), fg_color="#28a745", hover_color="#218838", command=self.encrypt_text).pack(side="left", padx=10)
+        ctk.CTkButton(btn_frame, text="🔓 DECRYPT TEXT", font=("Arial", 13, "bold"), fg_color="#007bff", hover_color="#0069d9", command=self.decrypt_text).pack(side="left", padx=10)
+        ctk.CTkButton(btn_frame, text="CLEAR", font=("Arial", 13, "bold"), fg_color="gray", command=self.clear_text).pack(side="left", padx=10)
+        
+        ctk.CTkLabel(frame, text="Output Result:", font=("Arial", 14, "bold")).grid(row=3, column=0, pady=(5, 5), sticky="w", padx=20)
+        self.text_output = ctk.CTkTextbox(frame, font=("Consolas", 13), wrap="char")
+        self.text_output.grid(row=4, column=0, sticky="nsew", padx=20)
+        self.text_output.configure(state="disabled")
+        self._setup_text_bindings(self.text_output, readonly=True)
+        
+        ctk.CTkButton(frame, text="COPY TO CLIPBOARD", font=("Arial", 13, "bold"), command=self.copy_text_output).grid(row=5, column=0, pady=15)
+
+    def encrypt_text(self):
+        input_text = self.text_input.get("1.0", "end-1c")
+        if not input_text:
+            messagebox.showwarning("Warning", "Input is empty!")
+            return
+        
+        dialog = CustomPasswordDialog(self, "Password", "Enter encryption password:", confirm=True, check_strength=True)
+        password = dialog.result
+        if not password or password != dialog.confirm_result:
+            return
+            
+        try:
+            salt = os.urandom(16)
+            nonce = os.urandom(12)
+            aes_key, auth_key = self.derive_keys(password, salt)
+            password_hash = hashlib.sha256(auth_key).digest()
+            
+            cipher = Cipher(algorithms.AES(aes_key), modes.GCM(nonce))
+            encryptor = cipher.encryptor()
+            
+            header = MAGIC_BYTES + salt + nonce + password_hash
+            encryptor.authenticate_additional_data(header)
+            
+            ciphertext = encryptor.update(input_text.encode('utf-8')) + encryptor.finalize()
+            tag = encryptor.tag
+            
+            payload = header + ciphertext + tag
+            b64_output = base64.b64encode(payload).decode('utf-8')
+            
+            self.text_output.configure(state="normal")
+            self.text_output.delete("1.0", "end")
+            self.text_output.insert("1.0", b64_output)
+            self.text_output.configure(state="disabled")
+        except Exception as e:
+            messagebox.showerror("Error", f"Encryption failed: {str(e)}")
+
+    def decrypt_text(self):
+        b64_input = self.text_input.get("1.0", "end-1c").strip()
+        if not b64_input:
+            messagebox.showwarning("Warning", "Input is empty!")
+            return
+            
+        dialog = CustomPasswordDialog(self, "Password", "Enter decryption password:", confirm=False, check_strength=False)
+        password = dialog.result
+        if not password:
+            return
+            
+        try:
+            payload = base64.b64decode(b64_input)
+            if not payload.startswith(MAGIC_BYTES):
+                raise ValueError("Invalid format or not encrypted by VibeCrypt.")
+                
+            header_data = payload[:HEADER_SIZE]
+            salt = header_data[8:24]
+            nonce = header_data[24:36]
+            stored_hash = header_data[36:68]
+            tag = payload[-16:]
+            ciphertext = payload[HEADER_SIZE:-16]
+            
+            aes_key, auth_key = self.derive_keys(password, salt)
+            if hashlib.sha256(auth_key).digest() != stored_hash:
+                raise ValueError("Invalid Password!")
+                
+            cipher = Cipher(algorithms.AES(aes_key), modes.GCM(nonce, tag))
+            decryptor = cipher.decryptor()
+            
+            decryptor.authenticate_additional_data(header_data)
+            
+            decrypted_bytes = decryptor.update(ciphertext) + decryptor.finalize()
+            
+            self.text_output.configure(state="normal")
+            self.text_output.delete("1.0", "end")
+            self.text_output.insert("1.0", decrypted_bytes.decode('utf-8'))
+            self.text_output.configure(state="disabled")
+        except InvalidTag:
+            messagebox.showerror("Error", "Data corruption detected (Invalid Auth Tag or Header).")
+        except ValueError as ve:
+            messagebox.showerror("Error", str(ve))
+        except Exception as e:
+            messagebox.showerror("Error", f"Decryption failed: {str(e)}")
+
+    def clear_text(self):
+        self.text_input.delete("1.0", "end")
+        self.text_output.configure(state="normal")
+        self.text_output.delete("1.0", "end")
+        self.text_output.configure(state="disabled")
+        
+    def copy_text_output(self):
+        val = self.text_output.get("1.0", "end-1c")
+        if val:
+            self.clipboard_clear()
+            self.clipboard_append(val)
 
     # --- Compare Tab ---
     def _build_compare_tab(self):
-        frame = self.compare_tab
-        ttk.Label(frame, text="Select two files to compare:", font=("Tahoma", 12)).pack(pady=(20, 10))
-        self.file1_path = tk.StringVar()
-        file1_frame = ttk.Frame(frame)
-        file1_frame.pack(pady=5, fill="x", padx=20)
-        ttk.Entry(file1_frame, textvariable=self.file1_path, width=30, state="readonly", font=("Tahoma", 12)).pack(side="left", fill="x", expand=True)
-        ttk.Button(file1_frame, text="📁 File 1", command=lambda: self.browse_compare_file(self.file1_path, frame), style="TButton.TButton").pack(side="left", padx=5)
-        self.file2_path = tk.StringVar()
-        file2_frame = ttk.Frame(frame)
-        file2_frame.pack(pady=5, fill="x", padx=20)
-        ttk.Entry(file2_frame, textvariable=self.file2_path, width=30, state="readonly", font=("Tahoma", 12)).pack(side="left", fill="x", expand=True)
-        ttk.Button(file2_frame, text="📁 File 2", command=lambda: self.browse_compare_file(self.file2_path, frame), style="TButton.TButton").pack(side="left", padx=5)
-        self.compare_progress = ttk.Progressbar(frame, mode="indeterminate", length=250)
-        self.compare_progress.pack(pady=15)
-        self.compare_progress.pack_forget()
-        self.compare_button = tk.Button(frame, text="📝 Start Compare", bg="#FF9800", fg="white", font=("Tahoma", 12), command=lambda: self.start_compare_files(frame))
-        self.compare_button.pack(pady=5, ipadx=10, ipady=3)
-        self.compare_result = ttk.Label(frame, text="", font=("Tahoma", 12))
-        self.compare_result.pack(pady=10)
-        # Responsive hash display
-        self.compare_hash_frame = ttk.Frame(frame)
-        self.compare_hash_frame.pack(pady=(5, 0), fill="x")
-        # File 1 hash
-        self.hash1_text = tk.Text(self.compare_hash_frame, height=1, width=60, wrap="none", font=("Consolas", 9))
-        self.hash1_text.grid(row=0, column=0, padx=5, sticky="ew")
-        self.hash1_scroll = ttk.Scrollbar(self.compare_hash_frame, orient="horizontal", command=self.hash1_text.xview)
-        self.hash1_text.configure(xscrollcommand=self.hash1_scroll.set)
-        self.hash1_scroll.grid(row=1, column=0, sticky="ew", padx=5)
-        self.hash1_copy = ttk.Button(self.compare_hash_frame, text="Copy", command=lambda: self.copy_compare_hash(1), style="TButton.TButton")
-        self.hash1_copy.grid(row=0, column=1, padx=2)
-        # File 2 hash
-        self.hash2_text = tk.Text(self.compare_hash_frame, height=1, width=60, wrap="none", font=("Consolas", 9))
-        self.hash2_text.grid(row=2, column=0, padx=5, sticky="ew")
-        self.hash2_scroll = ttk.Scrollbar(self.compare_hash_frame, orient="horizontal", command=self.hash2_text.xview)
-        self.hash2_text.configure(xscrollcommand=self.hash2_scroll.set)
-        self.hash2_scroll.grid(row=3, column=0, sticky="ew", padx=5)
-        self.hash2_copy = ttk.Button(self.compare_hash_frame, text="Copy", command=lambda: self.copy_compare_hash(2), style="TButton.TButton")
-        self.hash2_copy.grid(row=2, column=1, padx=2)
-        self.hash1_text.grid_remove()
-        self.hash1_scroll.grid_remove()
-        self.hash1_copy.grid_remove()
-        self.hash2_text.grid_remove()
-        self.hash2_scroll.grid_remove()
-        self.hash2_copy.grid_remove()
-        self.compare_hash_frame.columnconfigure(0, weight=1)
+        frame = self.tabview.tab("Compare")
+        ctk.CTkLabel(frame, text="Select two files to compare byte-by-byte:", font=("Arial", 15)).pack(pady=(30, 15))
+        
+        self.file1_path, self.file2_path = ctk.StringVar(), ctk.StringVar()
+        
+        for var, label in [(self.file1_path, "File 1"), (self.file2_path, "File 2")]:
+            row = ctk.CTkFrame(frame, fg_color="transparent")
+            row.pack(fill="x", padx=40, pady=5)
+            ctk.CTkEntry(row, textvariable=var, state="readonly", height=35).pack(side="left", fill="x", expand=True, padx=(0, 10))
+            ctk.CTkButton(row, text=f"Browse {label}", width=100, height=35, font=("Arial", 13), command=lambda v=var: self.browse_generic(v, single=True)).pack(side="right")
+        
+        self.compare_result = ctk.CTkLabel(frame, text="", font=("Arial", 15, "bold"))
+        ctk.CTkButton(frame, text="START COMPARE", font=("Arial", 14, "bold"), command=self.start_compare_files).pack(pady=25, ipadx=15, ipady=5)
+        self.compare_result.pack(pady=5)
 
-    def browse_compare_file(self, var, win):
-        path = tkfiledialog.askopenfilename(parent=win)
-        if path:
-            var.set(path)
-        win.lift()
-        win.focus_force()
-
-    def start_compare_files(self, win):
-        file1 = self.file1_path.get()
-        file2 = self.file2_path.get()
-        if not file1 or not file2:
-            self.compare_result.config(text="Please select both files!", foreground="red")
+    def start_compare_files(self):
+        f1, f2 = self.file1_path.get(), self.file2_path.get()
+        if not f1 or not f2:
+            self.compare_result.configure(text="Please select both files!", text_color="#ff4444")
             return
-        self.compare_progress.pack()
-        self.compare_progress.start(10)
-        self.compare_result.config(text="Comparing...", foreground="black")
-        threading.Thread(target=self._compare_files_thread, args=(file1, file2, win), daemon=True).start()
+        self.compare_result.configure(text="Comparing...", text_color="gray")
+        threading.Thread(target=self._compare_files_thread, args=(f1, f2), daemon=True).start()
 
-    def _compare_files_thread(self, file1, file2, win):
+    def _compare_files_thread(self, file1, file2):
         try:
-            are_equal = self.compare_files(file1, file2)
-            result_text = "Files are identical ✅" if are_equal else "Files are different ❌"
-            color = "green" if are_equal else "red"
-            hash1 = self._file_hash(file1)
-            hash2 = self._file_hash(file2)
-            self.root.after(0, lambda: [
-                self.compare_progress.stop(),
-                self.compare_progress.pack_forget(),
-                self.compare_result.config(text=result_text, foreground=color),
-                self.file1_path.set(""),
-                self.file2_path.set(""),
-                self.hash1_text.config(state="normal"),
-                self.hash1_text.delete("1.0", tk.END),
-                self.hash1_text.insert(tk.END, f"SHA256 (File 1): {hash1}"),
-                self.hash1_text.config(state="disabled"),
-                self.hash1_text.grid(),
-                self.hash1_scroll.grid(),
-                self.hash1_copy.grid(),
-                self.hash2_text.config(state="normal"),
-                self.hash2_text.delete("1.0", tk.END),
-                self.hash2_text.insert(tk.END, f"SHA256 (File 2): {hash2}"),
-                self.hash2_text.config(state="disabled"),
-                self.hash2_text.grid(),
-                self.hash2_scroll.grid(),
-                self.hash2_copy.grid()
-            ])
+            are_equal = True
+            with open(file1, 'rb') as f1, open(file2, 'rb') as f2:
+                while True:
+                    b1, b2 = f1.read(4096), f2.read(4096)
+                    if b1 != b2:
+                        are_equal = False
+                        break
+                    if not b1: break
+            
+            result_text = "Files are identical" if are_equal else "Files are different"
+            color = "#00cc66" if are_equal else "#ff4444"
+            self.after(0, lambda: self.compare_result.configure(text=result_text, text_color=color))
         except Exception as e:
-            self.root.after(0, lambda: [
-                self.compare_progress.stop(),
-                self.compare_progress.pack_forget(),
-                self.compare_result.config(text="Error comparing files", foreground="red"),
-                self.hash1_text.grid_remove(),
-                self.hash1_scroll.grid_remove(),
-                self.hash1_copy.grid_remove(),
-                self.hash2_text.grid_remove(),
-                self.hash2_scroll.grid_remove(),
-                self.hash2_copy.grid_remove()
-            ])
+            self.after(0, lambda err=str(e): self.compare_result.configure(text=f"Error: {err}", text_color="#ff4444"))
 
-    def copy_compare_hash(self, which):
-        if which == 1:
-            val = self.hash1_text.get("1.0", tk.END).strip().replace("SHA256 (File 1): ", "")
-        else:
-            val = self.hash2_text.get("1.0", tk.END).strip().replace("SHA256 (File 2): ", "")
-        if val:
-            self.root.clipboard_clear()
-            self.root.clipboard_append(val)
+    # --- Hash Tab ---
+    def _build_hash_tab(self):
+        frame = self.tabview.tab("Hash")
+        ctk.CTkLabel(frame, text="Select a file to generate SHA-256 hash:", font=("Arial", 15)).pack(pady=(30, 15))
+        
+        self.hash_file_path = ctk.StringVar()
+        row = ctk.CTkFrame(frame, fg_color="transparent")
+        row.pack(fill="x", padx=40, pady=5)
+        ctk.CTkEntry(row, textvariable=self.hash_file_path, state="readonly", height=35).pack(side="left", fill="x", expand=True, padx=(0, 10))
+        ctk.CTkButton(row, text="Browse", width=100, height=35, font=("Arial", 13), command=lambda: self.browse_generic(self.hash_file_path, single=True, hash_calc=True)).pack(side="right")
+        
+        self.hash_result_box = ctk.CTkTextbox(frame, height=50, font=("Consolas", 14))
+        self.hash_result_box.pack(fill="x", padx=40, pady=25)
+        self.hash_result_box.configure(state="disabled")
+        
+        self.hash_copy_btn = ctk.CTkButton(frame, text="COPY HASH", font=("Arial", 13, "bold"), state="disabled", command=self.copy_hash)
+        self.hash_copy_btn.pack(pady=5, ipadx=10, ipady=5)
 
-    @staticmethod
-    def generate_key(password, salt):
-        kdf = PBKDF2HMAC(
-            algorithm=hashes.SHA256(),
-            length=32,
-            salt=salt,
-            iterations=100000,
-        )
-        key = base64.urlsafe_b64encode(kdf.derive(password.encode()))
-        return key
+    def browse_generic(self, var, single=False, hash_calc=False):
+        path = filedialog.askopenfilename()
+        if path: 
+            var.set(path)
+            if hash_calc:
+                threading.Thread(target=self._calc_hash_thread, args=(path,), daemon=True).start()
 
-    @staticmethod
-    def compare_files(file1, file2):
-        with open(file1, 'rb') as f1, open(file2, 'rb') as f2:
-            while True:
-                b1 = f1.read(4096)
-                b2 = f2.read(4096)
-                if b1 != b2:
-                    return False
-                if not b1:
-                    break
-        return True
-
-    def ask_password(self, prompt):
-        dialog = CustomPasswordDialog(self.root, "Password", prompt)
-        return dialog.result
-
-    def _file_hash(self, file_path):
+    def _calc_hash_thread(self, file_path):
         h = hashlib.sha256()
         try:
             with open(file_path, 'rb') as f:
                 while True:
-                    chunk = f.read(1024 * 1024)
-                    if not chunk:
-                        break
+                    chunk = f.read(CHUNK_SIZE)
+                    if not chunk: break
                     h.update(chunk)
-            return h.hexdigest()
+            hash_val = h.hexdigest()
+            self.after(0, lambda: self._update_hash_ui(hash_val))
         except Exception:
-            return "-"
+            self.after(0, lambda: self._update_hash_ui("Error reading file", error=True))
 
-    def _on_tab_changed(self, event):
-        tab = event.widget.tab(event.widget.index("current"), "text")
-        if tab == "🔓 Decrypt":
-            self.refresh_file_list()
-
-    def _build_hash_tab(self):
-        frame = self.hash_tab
-        ttk.Label(frame, text="Select a file to see its SHA256 hash:", font=("Tahoma", 12)).pack(pady=(20, 5))
-        self.hash_file_path = tk.StringVar()
-        entry = ttk.Entry(frame, textvariable=self.hash_file_path, width=40, state="readonly",font=("Tahoma", 12))
-        entry.pack(pady=2)
-        ttk.Button(frame, text="📁 Browse", command=self.browse_hash_file, style="TButton.TButton").pack(pady=2)
-        self.hash_result_label = ttk.Label(frame, text="", font=("Consolas", 10))
-        self.hash_result_label.pack(pady=(10, 2))
-        self.hash_copy_btn = ttk.Button(frame, text="Copy", command=self.copy_hash, state="disabled",style="TButton.TButton")
-        self.hash_copy_btn.pack(pady=(0, 10))
-
-    def browse_hash_file(self):
-        path = tkfiledialog.askopenfilename()
-        if path:
-            self.hash_file_path.set(path)
-            hash_val = self._file_hash(path)
-            self.hash_result_label.config(text=hash_val)
-            self.hash_copy_btn.config(state="normal")
-        else:
-            self.hash_file_path.set("")
-            self.hash_result_label.config(text="")
-            self.hash_copy_btn.config(state="disabled")
+    def _update_hash_ui(self, content, error=False):
+        self.hash_result_box.configure(state="normal")
+        self.hash_result_box.delete("1.0", "end")
+        self.hash_result_box.insert("1.0", content)
+        self.hash_result_box.configure(state="disabled")
+        self.hash_copy_btn.configure(state="disabled" if error else "normal")
 
     def copy_hash(self):
-        hash_val = self.hash_result_label.cget("text")
-        if hash_val:
-            self.root.clipboard_clear()
-            self.root.clipboard_append(hash_val)
+        val = self.hash_result_box.get("1.0", "end-1c").strip()
+        if val and "Error" not in val:
+            self.clipboard_clear()
+            self.clipboard_append(val)
 
-    def ensure_directories(self):
-        self.ENCRYPTED_DIR.mkdir(exist_ok=True)
-        self.DECRYPTED_DIR.mkdir(exist_ok=True)
-
+    # --- Help Tab ---
     def _build_help_tab(self):
-        frame = self.help_tab
-        ttk.Label(frame, text="📚 User Guide & Documentation", font=("Segoe UI", 12, "bold")).pack(pady=(20, 10))
-        # Create a scrollable frame for content
-        canvas = tk.Canvas(frame)
-        scrollbar = ttk.Scrollbar(frame, orient="vertical", command=canvas.yview)
-        scrollable_frame = ttk.Frame(canvas)
+        frame = self.tabview.tab("Help")
+        textbox = ctk.CTkTextbox(frame, font=("Arial", 14), wrap="word")
+        textbox.pack(fill="both", expand=True, padx=20, pady=20)
         
-        scrollable_frame.bind(
-            "<Configure>",
-            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
-        )
-        
-        canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
-        canvas.configure(yscrollcommand=scrollbar.set)
-        # Quick Start Guide
-        ttk.Label(scrollable_frame, text="🚀 Quick Start Guide", 
-                 font=("Segoe UI", 12, "bold")).pack(pady=(10, 5), padx=20, anchor="w")
-        quick_start = """
-        1. Select a file using the Browse button
-        2. Enter a strong password
-        3. Click Encrypt to secure your file
-        4. Find encrypted file in 'encrypted_files' folder
-        """
-        ttk.Label(scrollable_frame, text=quick_start, wraplength=700).pack(padx=20, anchor="w")
-        # Features
-        ttk.Label(scrollable_frame, text="✨ Features", 
-                 font=("Segoe UI", 12, "bold")).pack(pady=(10, 5), padx=20, anchor="w")
-        features = """
-        • File Encryption: Secure your files with strong encryption
-        • File Decryption: Easily decrypt your files with password
-        • File Comparison: Compare files byte by byte
-        • Hash Generation: Generate SHA-256 hashes for files
-        • Password Strength: Real-time password strength checking
-        • Progress Tracking: Visual progress for all operations
-        """
-        ttk.Label(scrollable_frame, text=features, wraplength=700).pack(padx=20, anchor="w")
-        # Security Tips
-        ttk.Label(scrollable_frame, text="🔒 Security Tips", 
-                 font=("Segoe UI", 12, "bold")).pack(pady=(10, 5), padx=20, anchor="w")
-        security_tips = """
-        • Use strong passwords (min. 8 characters)
-        • Include numbers, letters, and special characters
-        • Never share your encryption passwords
-        • Keep backup copies of important files
-        • Store passwords securely
-        """
-        ttk.Label(scrollable_frame, text=security_tips, wraplength=700).pack(padx=20, anchor="w")
-        # Technical Details
-        ttk.Label(scrollable_frame, text="⚙️ Technical Details", 
-                 font=("Segoe UI", 12, "bold")).pack(pady=(10, 5), padx=20, anchor="w")
-        tech_details = """
-        • Encryption: Fernet (symmetric encryption)
-        • Hash Algorithm: SHA-256
-        • File Handling: Chunk-based processing
-        • Password Derivation: PBKDF2 with SHA-256
-        • Salt: Random 16-byte salt per file
-        """
-        ttk.Label(scrollable_frame, text=tech_details, wraplength=700).pack(padx=20, anchor="w")
-        # Troubleshooting
-        ttk.Label(scrollable_frame, text="🔧 Troubleshooting", 
-                 font=("Segoe UI", 12, "bold")).pack(pady=(10, 5), padx=20, anchor="w")
-        troubleshooting = """
-        Common Issues:
-        • Wrong Password: Ensure you're using the correct password
-        • File Access: Check file permissions
-        • Corrupted Files: Verify file integrity
-        • Memory Issues: Close other applications
-        """
-        ttk.Label(scrollable_frame, text=troubleshooting, wraplength=700).pack(padx=20, anchor="w")
-        # Contact & Support
-        ttk.Label(scrollable_frame, text="📞 Contact & Support", 
-                 font=("Segoe UI", 12, "bold")).pack(pady=(10, 5), padx=20, anchor="w")
-        contact = """
-        For support and feedback:
-        • github.com/hooman-nourbakhsh/VibeCrypt
-        """
-        ttk.Label(scrollable_frame, text=contact, wraplength=700).pack(padx=20, anchor="w")
-        # Pack the scrollable area
-        canvas.pack(side="left", fill="both", expand=True)
-        scrollbar.pack(side="right", fill="y")
+        help_content = """QUICK START
+--------------------------------------------------
+1. Browse and select one or MULTIPLE files to Encrypt/Decrypt.
+2. Enter a strong password.
+3. Choose the destination (File for single, Folder for batch).
+4. Wait for the success message.
+
+
+FEATURES & ARCHITECTURE
+--------------------------------------------------
+- Smart Batch Processing: Encrypt/Decrypt hundreds of files at once.
+- File Splitting: Break massive files into smaller chunks (e.g., 100MB parts) for easy upload.
+- Text Vault: Encrypt sensitive text strings instantly into Base64 format without creating files.
+- Military-Grade Encryption: AES-256 in GCM mode.
+- Advanced KDF: Argon2id algorithm defends against GPU/ASIC attacks.
+- Secure Shredder: Optional irreversible deletion of original files.
+- Fast-Fail Mechanism: Instantly rejects wrong passwords without locking.
+
+
+SECURITY TIPS
+--------------------------------------------------
+- Use passwords longer than 12 characters with mixed symbols.
+- DO NOT FORGET YOUR PASSWORD. There is absolutely no recovery.
+- For maximum security, always enable the Secure Shredder feature.
+
+
+SUPPORT
+--------------------------------------------------
+GitHub: github.com/hooman-nourbakhsh/VibeCrypt
+"""
+        textbox.insert("1.0", help_content)
+        textbox.configure(state="disabled")
 
 if __name__ == "__main__":
-    root = tk.Tk()
-    style = ttk.Style()
-    style.configure("TButton.TButton", font=("Tahoma", 12))
-    app = FileEncryptorGUI(root)
-    root.mainloop()
+    app = FileEncryptorGUI()
+    app.mainloop()

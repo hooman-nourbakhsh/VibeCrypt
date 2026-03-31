@@ -1,201 +1,219 @@
-from cryptography.fernet import Fernet
-from cryptography.hazmat.primitives import hashes
-from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
-import base64
 import os
+import sys
 import getpass
-from datetime import datetime
-import mimetypes
-import shutil
+import hashlib
 from pathlib import Path
 
-# Main paths
-BASE_DIR = Path(__file__).parent.absolute()
-ENCRYPTED_DIR = BASE_DIR / "encrypted_files"
-DECRYPTED_DIR = BASE_DIR / "decrypted_files"
+# Cryptographic libraries
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+from cryptography.exceptions import InvalidTag
+import argon2
 
-def ensure_directories():
-    """Create required folders if they do not exist"""
-    ENCRYPTED_DIR.mkdir(exist_ok=True)
-    DECRYPTED_DIR.mkdir(exist_ok=True)
+# Global Constants
+MAGIC_BYTES = b"CORE_DMP"
+CHUNK_SIZE = 1024 * 1024  # 1MB chunk size
+HEADER_SIZE = len(MAGIC_BYTES) + 16 + 12 + 32  # 68 bytes
 
-def generate_key(password, salt):
-    kdf = PBKDF2HMAC(
-        algorithm=hashes.SHA256(),
-        length=32,
+def print_progress(current, total, prefix='Progress', length=40):
+    """Prints a simple progress bar to the console."""
+    if total == 0: total = 1
+    percent = ("{0:.1f}").format(100 * (current / float(total)))
+    filled_length = int(length * current // total)
+    bar = '█' * filled_length + '-' * (length - filled_length)
+    sys.stdout.write(f'\r{prefix}: |{bar}| {percent}% Complete')
+    sys.stdout.flush()
+    if current == total:
+        sys.stdout.write('\n')
+
+def derive_keys(password: str, salt: bytes):
+    """Generates Master Key with Argon2id and splits it using HKDF."""
+    master_key = argon2.low_level.hash_secret_raw(
+        secret=password.encode('utf-8'),
         salt=salt,
-        iterations=100000,
+        time_cost=3,
+        memory_cost=65536,
+        parallelism=4,
+        hash_len=32, 
+        type=argon2.low_level.Type.ID
     )
-    key = base64.urlsafe_b64encode(kdf.derive(password.encode()))
-    return key
+    
+    hkdf = HKDF(
+        algorithm=hashes.SHA256(),
+        length=64, 
+        salt=salt, 
+        info=b"VibeCrypt-KeyExpansion"
+    )
+    expanded_key = hkdf.derive(master_key)
+    
+    return expanded_key[:32], expanded_key[32:]
 
 def encrypt_file(input_file, password):
     try:
-        # Convert path to Path object
-        input_path = Path(input_file)
+        input_path = Path(input_file).resolve()
         
-        # Check if file exists
-        if not input_path.exists():
-            return f"Error: File '{input_file}' not found."
+        if not input_path.exists() or not input_path.is_file():
+            return f"\n[!] Error: File '{input_path.name}' not found."
 
-        # Ensure required directories exist
-        ensure_directories()
-
-        # Generate a random salt
+        # In-Place Output Logic: same folder, append '_out' before extension
+        output_filename = input_path.with_name(f"{input_path.stem}_out{input_path.suffix}")
+        
         salt = os.urandom(16)
+        nonce = os.urandom(12)
+        aes_key, auth_key = derive_keys(password, salt)
+        password_hash = hashlib.sha256(auth_key).digest()
         
-        # Generate encryption key from password
-        key = generate_key(password, salt)
-        f = Fernet(key)
+        cipher = Cipher(algorithms.AES(aes_key), modes.GCM(nonce))
+        encryptor = cipher.encryptor()
         
-        # Read file in binary mode
-        with open(input_path, 'rb') as file:
-            file_data = file.read()
+        # Inject AAD for Header Integrity Check
+        header = MAGIC_BYTES + salt + nonce + password_hash
+        encryptor.authenticate_additional_data(header)
         
-        # Encrypt the data
-        encrypted_data = f.encrypt(file_data)
+        file_size = os.path.getsize(input_path)
+        print(f"\nEncrypting: {input_path.name}")
         
-        # Create encrypted file name
-        encrypted_file = ENCRYPTED_DIR / f"encrypted_{input_path.name}.enc"
-        
-        # Save salt and encrypted data
-        with open(encrypted_file, "wb") as f:
-            f.write(salt + encrypted_data)
-        
-        return f"File encrypted successfully! Saved as: {encrypted_file}"
+        with open(input_path, 'rb') as f_in, open(output_filename, 'wb') as f_out:
+            f_out.write(header)
+            read_bytes = 0
+            
+            while True:
+                chunk = f_in.read(CHUNK_SIZE)
+                if not chunk: break
+                f_out.write(encryptor.update(chunk))
+                read_bytes += len(chunk)
+                print_progress(read_bytes, file_size, prefix='Encrypting')
+                
+            encryptor.finalize()
+            f_out.write(encryptor.tag)
+            
+        return f"\n[+] Success! File saved at: {output_filename}"
     
     except Exception as e:
-        return f"Error during encryption: {str(e)}"
+        if 'output_filename' in locals() and output_filename.exists():
+            os.remove(output_filename) # Cleanup on failure
+        return f"\n[!] Error during encryption: {str(e)}"
 
 def decrypt_file(encrypted_file, password):
     try:
-        # Convert path to Path object
-        encrypted_path = Path(encrypted_file)
+        encrypted_path = Path(encrypted_file).resolve()
         
-        # Check if file exists
-        if not encrypted_path.exists():
-            return f"Error: File '{encrypted_file}' not found."
+        if not encrypted_path.exists() or not encrypted_path.is_file():
+            return f"\n[!] Error: File '{encrypted_path.name}' not found."
 
-        # Ensure required directories exist
-        ensure_directories()
-
-        # Read encrypted file
-        with open(encrypted_path, "rb") as f:
-            data = f.read()
+        file_size = os.path.getsize(encrypted_path)
         
-        # Extract salt and encrypted data
-        salt = data[:16]
-        encrypted_data = data[16:]
-        
-        # Generate key from password
-        key = generate_key(password, salt)
-        f = Fernet(key)
-        
-        # Decrypt data
-        decrypted_data = f.decrypt(encrypted_data)
-        
-        # Get original filename
-        original_name = encrypted_path.stem.replace("encrypted_", "")
-        
-        # Save decrypted data with original name in the output directory
-        output_filename = DECRYPTED_DIR / original_name
-        
-        # Save decrypted data
-        with open(output_filename, "wb") as f:
-            f.write(decrypted_data)
-        
-        return f"File decrypted successfully! Saved as: {output_filename}"
-    
-    except Exception as e:
-        return f"Error during decryption: {str(e)}"
-
-def compare_files(file1, file2):
-    try:
-        # Convert paths to Path object
-        path1 = Path(file1)
-        path2 = Path(file2)
-        
-        # Check if files exist
-        if not path1.exists() or not path2.exists():
-            return "Error: One or both files not found."
+        with open(encrypted_path, 'rb') as f_in:
+            # Extract Tag from the absolute end
+            f_in.seek(-16, os.SEEK_END)
+            tag = f_in.read(16)
             
-        with open(path1, 'rb') as f1, open(path2, 'rb') as f2:
-            while True:
-                b1 = f1.read(4096)
-                b2 = f2.read(4096)
-                if b1 != b2:
-                    return "Files are different!"
-                if not b1:  # End of file
-                    break
-        return "Files are identical!"
-    except Exception as e:
-        return f"Error comparing files: {str(e)}"
+            # Read Header
+            f_in.seek(0)
+            header_data = f_in.read(HEADER_SIZE)
+            
+            if not header_data.startswith(MAGIC_BYTES):
+                return "\n[!] Error: File is not encrypted by VibeCrypt or is corrupted."
+                
+            salt = header_data[8:24]
+            nonce = header_data[24:36]
+            stored_hash = header_data[36:68]
+            
+            print("\nVerifying Password...")
+            aes_key, auth_key = derive_keys(password, salt)
+            
+            # Fast-Fail Check
+            if hashlib.sha256(auth_key).digest() != stored_hash:
+                return "\n[!] Error: Invalid Password!"
+            
+            data_size = file_size - HEADER_SIZE - 16
+            if data_size < 0:
+                return "\n[!] Error: File structure is corrupted."
+                
+            # Setup Decryptor
+            cipher = Cipher(algorithms.AES(aes_key), modes.GCM(nonce, tag))
+            decryptor = cipher.decryptor()
+            
+            # Inject AAD for Header Integrity Check
+            decryptor.authenticate_additional_data(header_data)
+            
+            # In-Place Output Logic: same folder, append '_decrypted'
+            clean_stem = encrypted_path.stem.replace("_out", "")
+            output_filename = encrypted_path.with_name(f"{clean_stem}{encrypted_path.suffix}")
+            
+            print(f"Decrypting: {encrypted_path.name}")
+            f_in.seek(HEADER_SIZE)
+            
+            with open(output_filename, "wb") as f_out:
+                read_bytes = 0
+                while read_bytes < data_size:
+                    chunk = f_in.read(min(CHUNK_SIZE, data_size - read_bytes))
+                    f_out.write(decryptor.update(chunk))
+                    read_bytes += len(chunk)
+                    print_progress(read_bytes, data_size, prefix='Decrypting')
+                    
+                try:
+                    decryptor.finalize()
+                except InvalidTag:
+                    return "\n[!] Error: Data corruption detected (Invalid Auth Tag or Header)."
 
-def list_encrypted_files():
-    # Ensure required directories exist
-    ensure_directories()
+        return f"\n[+] Success! File saved at: {output_filename}"
     
-    encrypted_files = list(ENCRYPTED_DIR.glob("encrypted_*.enc"))
-    if not encrypted_files:
-        return "No encrypted files found."
-    
-    print("\nEncrypted files:")
-    for i, file in enumerate(encrypted_files, 1):
-        print(f"{i}. {file.name}")
-    return encrypted_files
+    except Exception as e:
+        if 'output_filename' in locals() and output_filename.exists():
+            os.remove(output_filename) # Cleanup on failure
+        return f"\n[!] Error during decryption: {str(e)}"
 
 def main():
-    # Ensure required directories exist at program start
-    ensure_directories()
-    
     while True:
-        print("\nFile Encryption Tool")
-        print("1. Encrypt a file")
-        print("2. Decrypt a file")
-        print("3. List encrypted files")
-        print("4. Compare two files")
-        print("5. For support and feedback")
-        print("6. Exit")
+        print("\n" + "="*35)
+        print(" VibeCrypt CLI - Core Engine")
+        print("="*35)
+        print("1. Encrypt File")
+        print("2. Decrypt File")
+        print("3. Exit")
         
-        choice = input("\nChoose an option (1-6): ")
+        choice = input("\nSelect an option (1-3): ").strip()
         
         if choice == "1":
-            input_file = input("Enter the path of the file to encrypt: ")
-            password = getpass.getpass("Enter encryption password: ")
+            input_file = input("Enter file path to ENCRYPT: ").strip()
+            # Clean path if dragged and dropped
+            if input_file.startswith(('"', "'")) and input_file.endswith(('"', "'")):
+                input_file = input_file[1:-1]
+                
+            password = getpass.getpass("Enter password: ")
+            confirm = getpass.getpass("Confirm password: ")
+            
+            if password != confirm:
+                print("\n[!] Error: Passwords do not match.")
+                continue
+            if not password:
+                print("\n[!] Error: Password cannot be empty.")
+                continue
+                
             result = encrypt_file(input_file, password)
             print(result)
             
         elif choice == "2":
-            encrypted_files = list_encrypted_files()
-            if isinstance(encrypted_files, list):
-                file_num = input("Enter the number of the file to decrypt: ")
-                try:
-                    selected_file = encrypted_files[int(file_num) - 1]
-                    password = getpass.getpass("Enter decryption password: ")
-                    result = decrypt_file(selected_file, password)
-                    print(result)
-                except (ValueError, IndexError):
-                    print("Invalid file number!")
-            else:
-                print(encrypted_files)
+            input_file = input("Enter file path to DECRYPT: ").strip()
+            # Clean path if dragged and dropped
+            if input_file.startswith(('"', "'")) and input_file.endswith(('"', "'")):
+                input_file = input_file[1:-1]
+                
+            password = getpass.getpass("Enter password: ")
+            if not password:
+                continue
+                
+            result = decrypt_file(input_file, password)
+            print(result)
                 
         elif choice == "3":
-            list_encrypted_files()
-            
-        elif choice == "4":
-            file1 = input("Enter the path of the first file: ")
-            file2 = input("Enter the path of the second file: ")
-            result = compare_files(file1, file2)
-            print(result)
-            
-        elif choice == "5":
-            print("• github.com/hooman-nourbakhsh/VibeCrypt")
-            
-        elif choice == "6":
+            print("\nExiting VibeCrypt Core. Stay secure!")
             break
-        
+            
         else:
-            print("Invalid option!")
+            print("\n[!] Invalid option.")
 
 if __name__ == "__main__":
-    main() 
+    main()
