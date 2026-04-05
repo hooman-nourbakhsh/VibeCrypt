@@ -1,5 +1,9 @@
+# set mirror in venv ==> pip config set global.index-url https://mirror-pypi.runflare.com/simple
+# --index-url https://mirror-pypi.runflare.com/simple
 # pip install -r requirements.txt
+
 cryptography>=46.0.0
-argon2-cffi>=25.0.0
+argon2-cffi>=25.1.0
 customtkinter>=5.2.0
-pyinstaller>=6.0.0
+zxcvbn>=4.5.0
+pyinstaller>=6.19.0

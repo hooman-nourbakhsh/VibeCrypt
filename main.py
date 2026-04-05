@@ -8,7 +8,7 @@ ctk.set_default_color_theme("blue")
 class FileEncryptorGUI(ctk.CTk):
     def __init__(self):
         super().__init__()
-        self.title("VibeCrypt - Advanced File Security")
+        self.title("CoreLock")
         
         # Center Main Window
         width = 750
@@ -25,7 +25,7 @@ class FileEncryptorGUI(ctk.CTk):
         self.header_frame = ctk.CTkFrame(self, fg_color="transparent")
         self.header_frame.pack(fill="x", padx=20, pady=10)
         
-        self.title_label = ctk.CTkLabel(self.header_frame, text="VibeCrypt Security", font=("Arial", 20, "bold"))
+        self.title_label = ctk.CTkLabel(self.header_frame, text="CoreLock: Secure The Core", font=("Arial", 20, "bold"))
         self.title_label.pack(side="left")
         
         self.theme_switch = ctk.CTkSwitch(self.header_frame, text="Dark Mode", font=("Arial", 12), command=self.toggle_theme)
