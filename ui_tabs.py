@@ -46,7 +46,7 @@ SECURITY TIPS
 
 SUPPORT
 --------------------------------------------------
-GitHub: github.com/hooman-nourbakhsh/VibeCrypt
+GitHub: github.com/hooman-nourbakhsh/CoreLock
 """
         textbox.insert("1.0", help_content)
         textbox.configure(state="disabled")
