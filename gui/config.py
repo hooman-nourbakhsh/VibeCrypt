@@ -1,0 +1,3 @@
+MAGIC_BYTES = b"CORE_DMP"
+CHUNK_SIZE = 1024 * 1024  # 1MB chunk size
+HEADER_SIZE = len(MAGIC_BYTES) + 16 + 12 + 32  # 68 bytes
