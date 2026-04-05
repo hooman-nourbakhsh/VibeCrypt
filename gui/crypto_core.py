@@ -1,5 +1,4 @@
 import os
-import hashlib
 import base64
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives import hashes
@@ -7,7 +6,7 @@ from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.exceptions import InvalidTag
 import argon2
 
-from config import MAGIC_BYTES, HEADER_SIZE, CHUNK_SIZE
+from config import MAGIC_BYTES, HEADER_SIZE, CHUNK_SIZE, VERIFY_PLAINTEXT
 from file_ops import get_parts, MultiFileReader
 
 def derive_keys(password: str, salt: bytes):
@@ -22,34 +21,62 @@ def derive_keys(password: str, salt: bytes):
     )
     hkdf = HKDF(
         algorithm=hashes.SHA256(),
-        length=64,
+        length=32,
         salt=salt,
-        info=b"VibeCrypt-KeyExpansion"
+        info=b"CoreLock-KeyExpansion"
     )
-    expanded_key = hkdf.derive(master_key)
-    return expanded_key[:32], expanded_key[32:]
+    aes_key = hkdf.derive(master_key)
+    return aes_key
+
+def build_verify_block(aes_key: bytes, salt: bytes):
+    nonce_verify = os.urandom(12)
+    cipher = Cipher(algorithms.AES(aes_key), modes.GCM(nonce_verify))
+    enc = cipher.encryptor()
+    
+    verify_aad = MAGIC_BYTES + salt
+    enc.authenticate_additional_data(verify_aad)
+    
+    ct = enc.update(VERIFY_PLAINTEXT) + enc.finalize()
+    return nonce_verify, ct, enc.tag
+
+def check_verify_block(aes_key: bytes, salt: bytes, nonce_verify: bytes, verify_ct: bytes, verify_tag: bytes) -> bool:
+    try:
+        cipher = Cipher(algorithms.AES(aes_key), modes.GCM(nonce_verify, verify_tag))
+        dec = cipher.decryptor()
+        
+        verify_aad = MAGIC_BYTES + salt
+        dec.authenticate_additional_data(verify_aad)
+        
+        plaintext = dec.update(verify_ct) + dec.finalize()
+        return plaintext == VERIFY_PLAINTEXT
+    except InvalidTag:
+        return False
 
 def verify_file_password(first_file: str, password: str):
     with open(first_file, "rb") as f_in:
         if f_in.read(len(MAGIC_BYTES)) != MAGIC_BYTES:
-            raise ValueError("File is not encrypted by VibeCrypt.")
+            raise ValueError("File is not encrypted by CoreLock.")
         salt = f_in.read(16)
-        f_in.read(12)
-        stored_hash = f_in.read(32)
-        _, auth_key = derive_keys(password, salt)
-        if hashlib.sha256(auth_key).digest() != stored_hash:
+        _nonce_main = f_in.read(12)
+        nonce_verify = f_in.read(12)
+        verify_ct = f_in.read(32)
+        verify_tag = f_in.read(16)
+        
+        aes_key = derive_keys(password, salt)
+        if not check_verify_block(aes_key, salt, nonce_verify, verify_ct, verify_tag):
             raise ValueError("Invalid Password!")
 
 def encrypt_file_stream(input_path, output_path, password, split_size_mb, progress_callback=None):
     salt = os.urandom(16)
-    nonce = os.urandom(12)
-    aes_key, auth_key = derive_keys(password, salt)
-    password_hash = hashlib.sha256(auth_key).digest()
+    nonce_main = os.urandom(12)
+    aes_key = derive_keys(password, salt)
     
-    cipher = Cipher(algorithms.AES(aes_key), modes.GCM(nonce))
+    nonce_verify, verify_ct, verify_tag = build_verify_block(aes_key, salt)
+    
+    cipher = Cipher(algorithms.AES(aes_key), modes.GCM(nonce_main))
     encryptor = cipher.encryptor()
     
-    header = MAGIC_BYTES + salt + nonce + password_hash
+    header = MAGIC_BYTES + salt + nonce_main + nonce_verify + verify_ct + verify_tag
     encryptor.authenticate_additional_data(header)
     
     file_size = os.path.getsize(input_path)
@@ -123,10 +150,11 @@ def decrypt_file_stream(input_path, output_path, password, progress_callback=Non
     with open(parts[0], 'rb') as f_first:
         header_data = f_first.read(HEADER_SIZE)
         salt = header_data[8:24]
-        nonce = header_data[24:36]
-        aes_key, _ = derive_keys(password, salt)
+        nonce_main = header_data[24:36]
         
-    cipher = Cipher(algorithms.AES(aes_key), modes.GCM(nonce, tag))
+        aes_key = derive_keys(password, salt)
+        
+    cipher = Cipher(algorithms.AES(aes_key), modes.GCM(nonce_main, tag))
     decryptor = cipher.decryptor()
     decryptor.authenticate_additional_data(header_data)
     
@@ -152,14 +180,15 @@ def decrypt_file_stream(input_path, output_path, password, progress_callback=Non
 
 def encrypt_text(input_text: str, password: str) -> str:
     salt = os.urandom(16)
-    nonce = os.urandom(12)
-    aes_key, auth_key = derive_keys(password, salt)
-    password_hash = hashlib.sha256(auth_key).digest()
+    nonce_main = os.urandom(12)
+    aes_key = derive_keys(password, salt)
     
-    cipher = Cipher(algorithms.AES(aes_key), modes.GCM(nonce))
+    nonce_verify, verify_ct, verify_tag = build_verify_block(aes_key, salt)
+    
+    cipher = Cipher(algorithms.AES(aes_key), modes.GCM(nonce_main))
     encryptor = cipher.encryptor()
     
-    header = MAGIC_BYTES + salt + nonce + password_hash
+    header = MAGIC_BYTES + salt + nonce_main + nonce_verify + verify_ct + verify_tag
     encryptor.authenticate_additional_data(header)
     
     ciphertext = encryptor.update(input_text.encode('utf-8')) + encryptor.finalize()
@@ -171,20 +200,22 @@ def encrypt_text(input_text: str, password: str) -> str:
 def decrypt_text(b64_input: str, password: str) -> str:
     payload = base64.b64decode(b64_input)
     if not payload.startswith(MAGIC_BYTES):
-        raise ValueError("Invalid format or not encrypted by VibeCrypt.")
+        raise ValueError("Invalid format or not encrypted by CoreLock.")
         
     header_data = payload[:HEADER_SIZE]
     salt = header_data[8:24]
-    nonce = header_data[24:36]
-    stored_hash = header_data[36:68]
+    nonce_main = header_data[24:36]
+    nonce_verify = header_data[36:48]
+    verify_ct = header_data[48:80]
+    verify_tag = header_data[80:96]
     tag = payload[-16:]
     ciphertext = payload[HEADER_SIZE:-16]
     
-    aes_key, auth_key = derive_keys(password, salt)
-    if hashlib.sha256(auth_key).digest() != stored_hash:
+    aes_key = derive_keys(password, salt)
+    if not check_verify_block(aes_key, salt, nonce_verify, verify_ct, verify_tag):
         raise ValueError("Invalid Password!")
         
-    cipher = Cipher(algorithms.AES(aes_key), modes.GCM(nonce, tag))
+    cipher = Cipher(algorithms.AES(aes_key), modes.GCM(nonce_main, tag))
     decryptor = cipher.decryptor()
     decryptor.authenticate_additional_data(header_data)
     
